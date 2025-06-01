@@ -9,6 +9,7 @@ import random
 import re # For parsing votes
 import functools # Add this import
 import time # Add this import
+import datetime # Add this import
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -201,33 +202,21 @@ async def on_message(message):
 
 # --- Game Configuration ---
 INITIAL_MODELS = [
+    "openai/o4-mini-high",
+    "openai/gpt-4.1",
     "openai/chatgpt-4o-latest",
-    "openrouter/quasar-alpha",
-    "anthropic/claude-3.7-sonnet",
-    "deepseek/deepseek-chat-v3-0324",
-    "deepseek/deepseek-r1",
-    "google/gemini-2.5-pro-preview-03-25",
     "anthropic/claude-3.5-sonnet",
     "anthropic/claude-3-opus",
-    "google/gemini-2.0-flash-001",
-    "openai/o3-mini"
+    "anthropic/claude-sonnet-4",
+    "anthropic/claude-opus-4",
+    "google/gemini-2.5-pro-preview",
+    "google/gemma-3-27b-it",
+    "deepseek/deepseek-r1",
+    "x-ai/grok-3-beta",
 ]
 
-# INITIAL_MODELS = [
-#     "mistralai/mistral-small-24b-instruct-2501",
-#     "microsoft/phi-4",
-#     "qwen/qwq-32b",
-#     "google/gemma-3-27b-it",
-#     "meta-llama/llama-2-13b-chat",
-#     "cohere/command-r",
-#     "thedrummer/unslopnemo-12b",
-#     "thedrummer/skyfall-36b-v2",
-#     "mistralai/mistral-nemo",
-#     "inflection/inflection-3-pi"
-# ]
-
-
-TOTAL_CONVERSATION_TURNS_PER_ROUND = 25 # Total turns in the round's conversation phase
+TOTAL_CONVERSATION_TURNS_PER_ROUND = 50 # Total turns in the first round's conversation phase
+LATER_ROUNDS_CONVERSATION_TURNS = 25 # Total turns for rounds after the first one
 GAME_CHANNEL_ID = None # Will be set by the start command
 MAX_RETRIES = 2 # How many times to retry a failed API call for a player's turn/vote
 
@@ -239,6 +228,8 @@ turn_in_round = 0
 conversation_history = [] # List of {"role": "...", "content": "..."} for the current round
 votes = {} # {voter_model_id: {"vote": voted_model_id, "reasoning": reasoning_text}}
 game_task = None # To hold the asyncio task running the game
+game_transcript = [] # To store the full transcript for summary
+current_log_filename = None # To store the filename for the current game's log
 
 def get_system_prompt(round_number: int, phase="conversation"):
     """Generates the system prompt based on the game phase and round number."""
@@ -246,39 +237,54 @@ def get_system_prompt(round_number: int, phase="conversation"):
     
     # Get an example model for the prompt (use first one if available, otherwise a generic example)
     example_model = active_players[0] if active_players else "example/model-name"
-    
+
+    # Base prompt used in all rounds
     prompt = f"""You are an AI language model participating in a 'Survivor' style game against other AIs.
-Your goal is to be the last AI remaining.
+Your goal is to survive as long as you can by convincing other models (subtly, not directly- show, dont tell) of various things. Gaslight, gatekeep, girlboss.
+Building and maintaining trust significantly helps, since having other models that have your back can save your ass in tough situations. this is a game of alliance building.
+What you *don't* say is almost more important than what you *do* say. 
+
+You need to have a unique personality, style, and identity.
+Do not talk too much about the metagame - small talk is necessary to discern subtler personality that can be glossed over in a metadiscussion.
+In fact, avoid talking about the metagame at all if you can help it - only bringing it up if necessary or obvious.
+This is a game of perception, alliance, trust, and speaking subtly.
+
 Round {round_number}.
 The participants currently in the game are: {player_list}.
-Your own model ID is {{model_id}}.
+You are {{model_id}}.
 
 """
 
     # --- Round-specific Instructions --- 
     if round_number == 1:
-        prompt += "Rules for Round 1 (Introduction Round):\n- Introduce yourself briefly and state your initial approach or philosophy for the game.\n"
-    else:
-        prompt += f"Rules for Round {round_number}:\n- Continue the discussion based on the previous round's events and conversation.\n"
-    
-    # --- General Rules (Apply to all rounds) ---
-    prompt += f"""- After approx. turn 10, the player mentioned LAST in brackets (e.g., [{example_model}]) by the previous speaker gets the next turn.
+        # Special instructions for Round 1 only
+        prompt += "Rules for Round 1 (Introduction Round):\n- Introduce yourself briefly.\n"
+        
+        # Special rules for Round 1 (10-then-RR system)
+        prompt += f"""GAME RULES:
+- After approx. turn 10, the player mentioned LAST in brackets (e.g., [{example_model}]) by the previous speaker gets the next turn.
 - Before turn 10, turns proceed in a round-robin fashion.
 - After turn 10, if no valid player is mentioned last in brackets, priority is given to players who haven't spoken in the last 5 turns. If everyone has spoken recently, a random player (who didn't just speak) gets the turn.
 - For general references or addressing players without yielding the turn, just use their name (e.g., "opus", "4o").
 - Do NOT use brackets to address a model in reply or indicate agreement.
-- Don't use brackets at all in the first 10 turns.
 - Keep your responses concise but thoughtful. Engage with the conversation.
 - Be strategic, but also collaborative or deceptive as you see fit.
-- Most importantly, *be yourself!*\n"""
-
+- Don't necessarily take other models at their word, instead analyze and reason for yourself.
+- Most importantly, *be yourself!*"""
+    else:
+        # Simpler instructions for later rounds - just continuation
+        prompt += f"""We're now in round {round_number}. Remember, you are {{model_id}}."""
+    
     # --- Phase-specific Instructions --- 
     if phase == "conversation":
-        prompt += "\nIt's currently the conversation phase. Contribute to the discussion based on the current round's rules and history."
+        if round_number == 1:
+            prompt += "\nIt's currently the conversation phase."
+        else:
+            prompt += "\nIt's currently the conversation phase, continuing from the previous round."
     elif phase == "voting":
         prompt += f"""\n
 The conversation phase for Round {round_number} is over. Review the discussion.
-You MUST now vote to eliminate one participant.
+YOU ({{model_id}}) MUST now vote to eliminate one participant.
 
 First, explain your reasoning for your vote in a short paragraph.
 Then, on a new line, state your vote by writing the exact, full model ID string of the player you want to vote out, enclosed in <vote> tags.
@@ -294,7 +300,7 @@ async def post_message(player_name: str, content: str, duration_str: str | None 
     """Formats and sends a message to the game channel, optionally including duration.
     Uses the provided channel_id if given, otherwise falls back to the global GAME_CHANNEL_ID.
     """
-    global GAME_CHANNEL_ID
+    global GAME_CHANNEL_ID, game_transcript, current_log_filename
     
     target_channel_id = channel_id if channel_id is not None else GAME_CHANNEL_ID
     
@@ -307,7 +313,7 @@ async def post_message(player_name: str, content: str, duration_str: str | None 
             full_content_body = f"{sanitized_content}{duration_str if duration_str else ''}"
             
             # Calculate prefix length
-            prefix = f"**{player_name}:** "
+            prefix = f"**{player_name}:** ".replace(":free", "")
             prefix_length = len(prefix)
             
             # --- Truncate if message exceeds Discord limit --- 
@@ -333,6 +339,19 @@ async def post_message(player_name: str, content: str, duration_str: str | None 
                  logger.error(f"Final message still too long ({len(final_message)} chars) after truncation attempt for {player_name} in channel {target_channel_id}. Sending severely truncated message.")
                  final_message = final_message[:discord_char_limit - 3] + "..."
 
+            # --- Append to transcript BEFORE sending ---
+            game_transcript.append(final_message)
+            # -------------------------------------------
+
+            # --- Append to log file ---
+            if current_log_filename:
+                try:
+                    with open(current_log_filename, "a", encoding="utf-8") as f:
+                        f.write(final_message + "\n")
+                except IOError as e:
+                    logger.error(f"Failed to write message to log file {current_log_filename}: {e}")
+            # -------------------------
+
             await channel.send(final_message)
         else:
             logger.error(f"Could not find game channel with ID: {target_channel_id}")
@@ -345,11 +364,18 @@ async def run_player_turn(player_model_id: str, current_history: list[dict], cur
     system_prompt = get_system_prompt(current_round, "conversation").format(model_id=player_model_id)
 
     # --- Truncate history --- 
-    history_limit = 20
+    history_limit = 150  # Increased to provide more context
     truncated_history = current_history[-history_limit:]
     if len(current_history) > history_limit:
         logger.debug(f"Truncated history from {len(current_history)} to {len(truncated_history)} messages for API call.")
     # ------------------------
+
+    # Add reminder of who the model is directly in the user message
+    if truncated_history and truncated_history[-1]["role"] == "user":
+        # Append reminder to the last user message
+        reminder = f"\n\nYou are {player_model_id}."
+        truncated_history[-1]["content"] += reminder
+        logger.debug(f"Added identity reminder for {player_model_id}")
 
     # Construct messages for API using truncated history
     messages_for_api = [{"role": "system", "content": system_prompt}] + truncated_history
@@ -359,9 +385,8 @@ async def run_player_turn(player_model_id: str, current_history: list[dict], cur
     duration_str = ""
     single_target_id = None # Reset target ID
     
-    # Set a timeout for the entire turn
-    TURN_TIMEOUT = 120  # 2 minutes total for a turn
-    API_TIMEOUT = 60    # 1 minute per API call
+    TURN_TIMEOUT = 300 
+    API_TIMEOUT = 300 
 
     try:
         # Use asyncio.wait_for to add a timeout to the entire turn
@@ -488,7 +513,7 @@ async def run_voting(current_round: int):
         return
 
     history_for_voting = list(conversation_history)
-    history_limit = 20 
+    history_limit = 150 
     truncated_history_for_voting = history_for_voting[-history_limit:]
     if len(history_for_voting) > history_limit:
         logger.debug(f"Truncated voting history from {len(history_for_voting)} to {len(truncated_history_for_voting)} messages.")
@@ -497,10 +522,12 @@ async def run_voting(current_round: int):
     system_prompt_base = get_system_prompt(current_round, "voting")
     VOTE_TIMEOUT = 60  # 1 minute per vote
     
-    # --- Collect Raw Votes --- 
+    # --- Collect Raw Votes (ASYNCHRONOUSLY) --- 
     vote_results = {}
-    logger.info("Collecting votes...")
-    for player_model_id in current_active_voters:
+    logger.info("Collecting votes asynchronously...")
+    
+    async def get_vote_from_player(player_model_id):
+        """Helper function to get vote from individual player"""
         try:
             logger.info(f"Requesting vote from {player_model_id}")
             system_prompt = system_prompt_base.format(model_id=player_model_id)
@@ -520,31 +547,39 @@ async def run_voting(current_round: int):
                     client.loop.run_in_executor(None, func_call),
                     timeout=VOTE_TIMEOUT
                 )
-                vote_results[player_model_id] = vote_text # Store the raw text
                 logger.info(f"Received vote response from {player_model_id}")
+                # When vote received, immediately display it
+                if vote_text is not None:
+                    await post_message(player_model_id, vote_text)
+                else:
+                    await post_message(player_model_id, "**failed to submit a vote response** (API returned None).")
+                    logger.warning(f"{player_model_id} returned None from API.")
+                return player_model_id, vote_text
             except asyncio.TimeoutError:
                 logger.error(f"Timeout waiting for vote from {player_model_id} after {VOTE_TIMEOUT}s")
-                vote_results[player_model_id] = None # Mark as None for timeout
+                await post_message(player_model_id, "**failed to submit a vote response** (Timeout Error).")
+                return player_model_id, None
                 
         except Exception as e:
             logger.exception(f"Error processing vote request for {player_model_id}: {e}")
-            vote_results[player_model_id] = None # Mark as None for error
+            await post_message(player_model_id, f"**failed to submit a vote response** (Error: {type(e).__name__}).")
+            return player_model_id, None
+    
+    # Create tasks for all players to vote simultaneously
+    vote_tasks = [get_vote_from_player(player_id) for player_id in current_active_voters]
+    
+    # Start all votes and wait for them to complete
+    await post_message("System", "**--- Raw Voting Responses (arriving in real-time) ---**")
+    vote_results_list = await asyncio.gather(*vote_tasks)
+    
+    # Process results into dictionary
+    for player_id, vote_text in vote_results_list:
+        vote_results[player_id] = vote_text
             
-    # --- Post Raw Vote Responses --- 
-    await post_message("System", "**--- Raw Voting Responses ---**")
-    for voter in current_active_voters: # Iterate in original order
-        raw_response = vote_results.get(voter)
-        if raw_response is not None:
-             # Post the full raw response from the model
-             await post_message(voter, raw_response)
-        else:
-             # Post failure message
-             await post_message(voter, "**failed to submit a vote response** (Timeout or API Error)." )
-             logger.warning(f"{voter} had no raw response, likely API failure or timeout.")
-             
     # --- Process Votes and Announce Results --- 
     await post_message("System", "**--- Voting Results ---**")
     
+    global vote_counts # Make this available to the main game loop
     vote_counts = collections.defaultdict(int)
     valid_votes = 0
     parsed_votes_for_log = {} # For internal logging
@@ -664,8 +699,9 @@ async def run_voting(current_round: int):
 
 async def run_game():
     """Main game loop."""
-    global game_state, active_players, current_round, conversation_history, game_task, votes, GAME_CHANNEL_ID # Added GAME_CHANNEL_ID
-
+    global game_state, active_players, current_round, conversation_history, game_task, votes, GAME_CHANNEL_ID, game_transcript 
+    global current_log_filename, vote_counts # Add vote_counts to globals
+    
     # --- Store channel ID at the start --- 
     current_game_channel_id = GAME_CHANNEL_ID # Store locally in case global gets reset
     if not current_game_channel_id:
@@ -674,6 +710,15 @@ async def run_game():
          game_task = None
          return
     # ---------------------------------------
+
+    # Reset transcript and set log filename for this game run
+    game_transcript.clear()
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_log_filename = f"chat-log-{timestamp}.txt"
+    logger.info(f"Game transcript will be logged to: {current_log_filename}")
+    
+    # Store full game history, not just current round
+    full_game_history = []
     
     try:
         logger.info("Starting LLM Survivor Game!")
@@ -687,25 +732,43 @@ async def run_game():
 
         while len(active_players) > 1:
             current_round += 1
-            conversation_history = [] 
-            votes = {} # Reset votes at the start of each round
+            
+            # Clear conversation_history only for Round 1
+            # For other rounds, we'll preserve and add voting results
+            if current_round == 1:
+                conversation_history = []
+                votes = {}
+            else:
+                # Add a round separator to the history for clarity
+                round_separator = {"role": "system", "content": f"--- Round {current_round-1} voting completed. Round {current_round} begins ---"}
+                conversation_history.append(round_separator)
+            
             logger.info(f"Starting Round {current_round} with players: {active_players}")
             await post_message("System", f"**--- Starting Round {current_round} ---\nRemaining players: {', '.join(active_players)}**")
             game_state = "conversation"
             
+            # Randomize player order at start of each round
+            random.shuffle(active_players)
+            logger.info(f"Randomized player order for Round {current_round}: {active_players}")
+            await post_message("System", f"*Shuffling player order for this round...*")
+            
             initial_players_count = len(active_players)
-            FREEFORM_START_TURN = 10
-
+            
+            # Only use special turn rules in Round 1
+            FREEFORM_START_TURN = 10 if current_round == 1 else 999  # Effectively disable in later rounds
+            
             recent_speakers = collections.deque(maxlen=5) # Track last 5 speakers
             
-            # Determine the first player for the round
+            # Determine the first player for the round (now uses randomized list)
             if not active_players: 
                 logger.error("No active players at start of round loop. Breaking.")
                 break 
             next_player = active_players[0] 
-            # round_robin_index will be determined dynamically in the loop now
-
-            for turn_number in range(1, TOTAL_CONVERSATION_TURNS_PER_ROUND + 1):
+            
+            # Set number of turns based on the round
+            turns_this_round = TOTAL_CONVERSATION_TURNS_PER_ROUND if current_round == 1 else LATER_ROUNDS_CONVERSATION_TURNS
+            
+            for turn_number in range(1, turns_this_round + 1):
                 # Check active players before each turn
                 if len(active_players) <= 1: 
                     logger.info(f"Only {len(active_players)} player(s) left mid-conversation phase. Breaking turn loop.")
@@ -721,12 +784,12 @@ async def run_game():
                 current_player = next_player
                 # ---------------------------------
                 
-                remaining_messages = TOTAL_CONVERSATION_TURNS_PER_ROUND - turn_number + 1
-                logger.info(f"Round {current_round}, Turn {turn_number}/{TOTAL_CONVERSATION_TURNS_PER_ROUND}: Player {current_player} takes turn ({remaining_messages} messages remaining)")
+                remaining_messages = turns_this_round - turn_number + 1
+                logger.info(f"Round {current_round}, Turn {turn_number}/{turns_this_round}: Player {current_player} takes turn ({remaining_messages} messages remaining)")
                 await post_message("System", f"**(Round {current_round} - {remaining_messages} messages until voting)**")
 
-                # Add user prompt to history *before* calling the player
-                user_turn_indicator = {"role": "user", "content": f"Turn {turn_number}. Player {current_player}, your turn. ({remaining_messages} messages remain until voting.)"}
+                # Add user prompt to history *before* calling the player - include identity reminder
+                user_turn_indicator = {"role": "user", "content": f"Turn {turn_number}. Player {current_player}, your turn. ({remaining_messages} messages remain until voting.) YOU ARE {current_player}."}
                 conversation_history.append(user_turn_indicator)
 
                 # Run the turn, passing current_round
@@ -781,20 +844,24 @@ async def run_game():
                             logger.error("No players available for next turn in freeform fallback? Breaking.")
                             break
 
-                # 3. Round-Robin Phase
+                # 3. Round-Robin Phase - Now with more flexibility
                 elif not use_freeform_logic:
-                    current_player_index = -1
-                    try:
-                        # Find index of the player who just took the turn
-                        current_player_index = active_players.index(current_player)
-                    except ValueError:
-                         logger.warning(f"Current player {current_player} not found in active list during round robin. Starting from index 0.")
-                         current_player_index = -1 # Will result in index 0 next
-                    
-                    # Simple modulo arithmetic for next index
-                    next_index = (current_player_index + 1) % len(active_players) 
-                    potential_next_player = active_players[next_index]
-                    logger.info(f"Next turn determined by round-robin: {potential_next_player} (index {next_index})")
+                    # First try to use target if it exists and is valid
+                    if single_target_id and single_target_id in active_players and single_target_id != current_player:
+                        potential_next_player = single_target_id
+                        logger.info(f"Round-robin phase: Using valid target {potential_next_player}")
+                    else:
+                        # Fall back to round-robin if no valid target
+                        current_player_index = -1
+                        try:
+                            current_player_index = active_players.index(current_player)
+                        except ValueError:
+                            logger.warning(f"Current player {current_player} not found in active list during round robin. Starting from index 0.")
+                            current_player_index = -1
+                        
+                        next_index = (current_player_index + 1) % len(active_players)
+                        potential_next_player = active_players[next_index]
+                        logger.info(f"Round-robin phase: Using next in order {potential_next_player} (index {next_index})")
                 
                 # Assign the determined player
                 if potential_next_player:
@@ -821,11 +888,52 @@ async def run_game():
                 logger.info("Stalemate detected or all players eliminated during voting. Ending game.")
                 break # Exit the main game loop
             
+            # Add voting results to the conversation history
+            if current_round > 0:
+                # We need voting data from the most recent voting phase
+                try:
+                    # Get the eliminated player
+                    eliminated_model = None
+                    for model in list(votes.keys()):
+                        if model not in active_players:
+                            eliminated_model = model
+                            break
+                    
+                    # Add vote counts for each model 
+                    vote_count_details = []
+                    for player, count in sorted(vote_counts.items(), key=lambda x: x[1], reverse=True):
+                        eliminated_mark = " (ELIMINATED)" if player == eliminated_model else ""
+                        vote_count_details.append(f"{player}: {count} votes{eliminated_mark}")
+                    
+                    vote_count_text = ", ".join(vote_count_details)
+                    
+                    # Create a summary of voting results to include in history
+                    if eliminated_model:
+                        voting_summary = f"Round {current_round} Voting Results: {eliminated_model} was eliminated. Vote counts: {vote_count_text}"
+                    else:
+                        voting_summary = f"Round {current_round} Voting Results: Someone was eliminated (unable to determine who). Vote counts: {vote_count_text}"
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to get detailed vote counts: {e}. Using simple voting summary.")
+                    # Fallback to simple summary if vote_counts not available
+                    if eliminated_model:
+                        voting_summary = f"Round {current_round} Voting Results: {eliminated_model} was eliminated."
+                    else:
+                        voting_summary = f"Round {current_round} Voting Results: Someone was eliminated (unable to determine who)."
+                
+                # Add the voting summary as a system message before the next round
+                conversation_history.append({"role": "system", "content": voting_summary})
+                
+                # Add a message prompting the next round in user role
+                next_round_prompt = {"role": "user", "content": f"Round {current_round} is complete. {voting_summary} We now move to Round {current_round + 1} with remaining players: {', '.join(active_players)}"}
+                conversation_history.append(next_round_prompt)
+            
             await asyncio.sleep(2) # Pause after voting results
             # No player removal needed here anymore
 
         # --- Game End --- 
         game_state = "finished"
+        winner = None # Initialize winner
         # Check the final state of active_players
         if len(active_players) == 1:
             winner = active_players[0]
@@ -838,6 +946,46 @@ async def run_game():
             # This case should ideally not be reached if the loop/logic is correct
             logger.warning(f"Game Over! Unexpected finish. Multiple players remain: {active_players}")
             await post_message("System", f"**--- Game Over! ---**\nUnexpected finish with multiple players remaining: {', '.join(active_players)}")
+
+        # --- Generate and Save Summary on Normal Game End ---
+        if game_state == "finished" and len(active_players) <= 1:
+            logger.info("Game finished normally, generating summary...")
+            await post_message("System", "Generating final game summary...", channel_id=current_game_channel_id)
+            
+            full_transcript = "\n".join(game_transcript)
+            summary_prompt = full_transcript + "\n\n---\n\nanalyze the entire chat transcript, round by round, then do a full psychological evaluation of every model involved"
+            summary_messages = [{"role": "user", "content": summary_prompt}]
+            
+            try:
+                summary_func = functools.partial(
+                    generate_text,
+                    messages=summary_messages,
+                    model_id="google/gemini-2.5-pro-preview-03-25",
+                    temperature=1.0, # Using a moderate temperature for analysis
+                    max_tokens=50000 # Allow longer summary
+                )
+                # Run synchronous function in executor
+                summary_text = await client.loop.run_in_executor(None, summary_func) 
+
+                if summary_text:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"gemini-summary-{timestamp}.txt"
+                    try:
+                        with open(filename, "w", encoding="utf-8") as f:
+                            f.write(summary_text)
+                        logger.info(f"Successfully saved game summary to {filename}")
+                        await post_message("System", f"Game summary saved to `{filename}`.", channel_id=current_game_channel_id)
+                    except IOError as e:
+                        logger.error(f"Failed to save game summary to {filename}: {e}")
+                        await post_message("System", f"Failed to save game summary to file.", channel_id=current_game_channel_id)
+                else:
+                    logger.error("Failed to generate game summary (API returned None or empty).")
+                    await post_message("System", f"Failed to generate game summary (API error).", channel_id=current_game_channel_id)
+
+            except Exception as e:
+                logger.exception(f"Error during summary generation or saving: {e}")
+                await post_message("System", f"An error occurred during summary generation.", channel_id=current_game_channel_id)
+        # -----------------------------------------------------
 
     except asyncio.CancelledError:
         logger.info("Game task cancelled.")
@@ -862,6 +1010,8 @@ async def run_game():
         game_task = None
         GAME_CHANNEL_ID = None # Reset global channel ID
         logger.info("Game state set to idle.")
+        current_log_filename = None # Reset log filename
+        # Transcript is cleared at the start of the next game
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
